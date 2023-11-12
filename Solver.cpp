@@ -525,50 +525,5 @@ char MTD(Node* node,char guess, int& counter, std::unordered_map<uint64_t,Bounds
  //QUICKLATE TRICKS PRODUCES UNSOUND SEARCH : IMPLEMENT A FUNCTIONING VERSION (HAGLUND) AND SEE IF IT IMPROVES PERFORMANCE//
  //IMPLEMENT LRU CACHE TO PREVENT CONTAINER OVERFLOW//
  //FORMAL TESTS?//
-int main() {
-	uint32_t cards = 0b10101010110100100011111000;
-	std::array<uint32_t, kNumSuits> suits = { 0b111111,0b1111111000000,0b1111110000000000000,0b11111110000000000000000000};
-	Node test_node0(cards, suits, 0);
-	Node test_node1(cards, suits, 1);
-	Node test_node2(cards, suits, 2);
-	Node test_node3(cards, suits, 3);
-	int counter = 0;
-	std::vector<Node> nodes = GWhistGenerator(100000, 1);
-	std::unordered_map<uint64_t, int> TTable0 = {};
-	std::unordered_map<uint64_t,Bounds> TTable1 = {};
-	std::unordered_map<uint64_t, char> TTable2 = {};
-	std::cout << TTable1.max_size() << std::endl;
-	std::cout << TTable2.max_size() << std::endl;
-	std::vector<int> results = {};
-	const auto start{ std::chrono::steady_clock::now() };
-	//int var1 = MTD(&test_node0, 0, counter, &TTable1);
-	int inconsistentc = 0;
-	int inconsistentm = 0;
-	for (auto it = nodes.begin(); it != nodes.end(); ++it) {
-		//int abc = AlphaBetaCache(&*it, 0, 13, counter, &TTable0);
-		char abm =MTD(&*it,0,counter, &TTable1);
-		//results.push_back(abm);
-		//int ab = AlphaBeta(&*it, 0, 13, counter);
-		//if (abc!=ab) {
-			//std::cout << "Inconsistency across search paradigms" << std::endl;
-			//inconsistentc++;
-		//}
-		//if (abm != ab) {
-			//inconsistentm++;
-		//}
-	}
-	const auto end{ std::chrono::steady_clock::now() };
-	const std::chrono::duration<double> elapsed_seconds{ end - start };
-	std::cout << elapsed_seconds.count() << std::endl;
-	std::cout << counter << std::endl;
-	std::cout << inconsistentc << std::endl;
-	std::cout << inconsistentm << std::endl;
-	//std::cout << results[0] << std::endl;
-	//std::cout << results[50000] << std::endl;
-	//std::cout << results[99999] << std::endl;
-	//std::cout << var1 << std::endl;
-	//std::cout << var2 << std::endl;
-	//std::cout << var3 << std::endl;
-	
-}
+
   

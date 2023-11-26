@@ -1,0 +1,982 @@
+#include <vector>
+#include <algorithm>
+#include <unordered_map>
+#include <intrin.h>
+#include <array>
+#include <iostream>
+#include <chrono>
+#include <cassert>
+#include <random>
+#include <ratio>
+#include <omp.h>
+  
+//#define DEBUG
+const int kNumSuits = 4;
+const int kNumRanks = 13;
+struct Triple {
+	char index;
+	char length;
+	uint32_t sig;
+	bool operator<(Triple& triple) {
+		return (length < triple.length)|| (length == triple.length && sig < triple.sig);
+	}
+};
+
+struct Pair {
+	char index;
+	char value;
+	Pair(char index_, char value_) {
+		index = index_;
+		value = value_;
+	}
+	bool operator<(Pair &pair) {
+		return value < pair.value;
+	}
+};
+struct Action {
+	uint32_t index;
+	unsigned char suit;
+	bool player;
+	Action(uint32_t index_, unsigned char suit_, bool player_) {
+		index = index_;
+		suit = suit_;
+		player = player_;
+	}
+};
+struct ActionValue {
+	Action action;
+	int value;
+	bool operator<(ActionValue& aval) {
+		return value < aval.value;
+	}
+};
+
+class Node {
+private:
+	uint32_t cards_;
+	std::array<uint32_t, kNumSuits> suit_masks_;
+	char total_tricks_;
+	char trump_;
+	char score_;
+	char moves_;
+	bool player_;
+	std::vector<Action> history_;
+	uint64_t key_;
+public:
+	Node(uint32_t cards, std::array<uint32_t, kNumSuits> suit_masks, char trump,bool player) {
+		cards_ = cards;
+		suit_masks_ = suit_masks;
+		total_tricks_ = __popcnt(cards);
+		trump_ = trump;
+		moves_ = 0;
+		player_ = player;
+		score_ = 0;
+		history_ = {};
+	};
+	bool Player() { return player_; };
+	char Score() { return score_; };
+	char Moves() { return moves_; };
+	bool IsTerminal() {
+		return (moves_ == 2 * total_tricks_);
+	}
+	char RemainingTricks() {
+		return (char)(total_tricks_-(moves_>>1));
+	}
+	char TotalTricks() {
+		return total_tricks_;
+	}
+	uint32_t Cards() { return cards_; }
+	std::array<uint32_t, kNumSuits> SuitMasks() { return suit_masks_; }
+	uint64_t GetNodeKey() { return key_; }
+	bool Trick(Action lead, Action follow) {
+		//true if leader won//
+		return (lead.suit != follow.suit && lead.suit == trump_) || (lead.suit == follow.suit && lead.index <= follow.index);
+	}
+	
+	void RemoveCard(Action action) {
+		//Removes card from cards_//
+		uint32_t mask_b = ~0;
+		mask_b =_bzhi_u32(mask_b, action.index);
+		uint32_t mask_a = ~mask_b;
+		mask_a = _blsr_u32(mask_a);
+		uint32_t copy_a = cards_ & mask_a;
+		uint32_t copy_b = cards_ & mask_b;
+		copy_a = copy_a >> 1;
+		cards_ = copy_a | copy_b;
+		//decrements appropriate suits//
+		suit_masks_[action.suit] = _blsr_u32(suit_masks_[action.suit])>>1;
+		char suit = action.suit;
+		suit++;
+		while (suit < kNumSuits) {
+			suit_masks_[suit]=suit_masks_[suit] >> 1;
+			suit++;
+		}
+	}
+	void InsertCard(Action action) {
+		//inserts card into cards_//
+		uint32_t mask_b = ~0;
+		mask_b = _bzhi_u32(mask_b, action.index);
+		uint32_t mask_a = ~mask_b;
+		uint32_t copy_b = cards_ & mask_b;
+		uint32_t copy_a = cards_ & mask_a;
+		copy_a = copy_a << 1;
+		uint32_t card = action.player<< action.index;
+		cards_ = card | copy_a | copy_b;
+		//increments appropriate suits//
+		uint32_t new_suit = (suit_masks_[action.suit] & mask_b )| (1 << action.index);
+		suit_masks_[action.suit] = ((suit_masks_[action.suit] & mask_a) << 1 )| new_suit;
+		char suit = action.suit;
+		suit++;
+		while (suit < kNumSuits) {
+			suit_masks_[suit] = suit_masks_[suit] << 1;
+			suit++;
+		}
+	}
+	void UpdateNodeKey() {
+		//recasts the cards and suitlengths into quasi-canonical form//
+		//least sig part of 32bit card is trump, then suits in ascending length//
+		
+		//note this canonical form does not take advantage of all isomorphisms//
+		//suppose a game is transformed as follows: all card bits flipped and the player bit flipped, ie player 1 has the lead and has player 0s cards from the original game//
+		//this implies player 1 achieves the minimax value of the original game ie the value is remaining tricks - value of the original game for this transformed game//
+		//also does not take advantage of single suit isomorphism. Namely all single suit games with the same card distribution are isomorphic. Currently this considers all trump, all no trump games as distinct//
+		uint64_t suit_sig = 0;
+		char trump_length = __popcnt(suit_masks_[trump_]);
+		if (trump_length > kNumRanks) {
+			throw;
+		}
+		std::vector<Triple> non_trump_lengths;
+		for (char i = 0; i < kNumSuits; ++i) {
+			if (i != trump_) {
+				char length = __popcnt(suit_masks_[i]);
+				uint32_t sig = suit_masks_[i]&cards_;
+				if (suit_masks_[i] != 0) {
+					sig = (sig >> (_tzcnt_u32(suit_masks_[i])));
+				}
+				if (length > kNumRanks) {
+					throw 1;
+				}
+				non_trump_lengths.push_back(Triple{i,length,sig });
+			}
+		}
+		//sorting takes advantage of two isomorphisms namely nontrump suits of nonequal length can be exchanged and the value of the game does not change//
+		//and this more complicated suppose two games with two or more (non_trump)suits of equal length, permuting those suits should not change the value of solved game ie it is an isomorphism//
+		std::sort(non_trump_lengths.begin(), non_trump_lengths.end());
+		suit_sig = suit_sig | trump_length;
+		for (size_t i = 0; i < non_trump_lengths.size(); ++i) {
+			suit_sig = suit_sig | ((uint64_t)non_trump_lengths[i].length << (4*(i+1)));
+		}
+		suit_sig = suit_sig << 32;
+		std::array<uint32_t, kNumSuits> suit_cards;
+		suit_cards[0] = cards_ & suit_masks_[trump_];
+		if (suit_masks_[trump_] != 0) {
+			suit_cards[0] = suit_cards[0] >> _tzcnt_u32(suit_masks_[trump_]);
+		}
+		uint32_t sum = __popcnt(suit_masks_[trump_]);
+		uint32_t cards = 0|suit_cards[0];
+		for (size_t i = 0; i < non_trump_lengths.size(); ++i) {
+			suit_cards[i] = cards_ & suit_masks_[non_trump_lengths[i].index];
+			uint32_t val = 0;
+			if (suit_masks_[non_trump_lengths[i].index] != 0) {
+				val = _tzcnt_u32(suit_masks_[non_trump_lengths[i].index]);
+			}
+			suit_cards[i]= suit_cards[i] >>val;
+			suit_cards[i] = suit_cards[i] << sum;
+			sum += __popcnt(suit_masks_[non_trump_lengths[i].index]);
+			cards = cards | suit_cards[i];
+		}
+		//cards = cards | (player_ << 31);
+		key_ = suit_sig | (uint64_t)cards;
+	#ifdef DEBUG_KEY
+		std::cout <<"CARDS_ " << cards_ << std::endl;
+		std::cout << "CARDS " << cards << std::endl;
+		std::cout << "SUIT MASKS " << std::endl;
+		for (int i = 0; i < kNumSuits; ++i) {  
+			std::cout << suit_masks_[i] << std::endl;
+		}
+		std::cout << "SUIT_SIG " << suit_sig << std::endl;
+		std::cout<<"KEY " << key_ << std::endl;
+	#endif 
+	}
+	uint64_t AltKey() {
+		uint32_t mask = _bzhi_u32(~0, 2 * RemainingTricks());
+		return key_ ^ (uint64_t)mask;
+	}
+	//Move Ordering Heuristics//
+	//These could Definitely be improved, very hacky//
+	int LeadOrdering(Action action) {
+		char suit = action.suit;
+		uint32_t copy_cards = cards_;
+		if (player_ == 0) {
+			copy_cards = ~copy_cards;
+		}
+		uint32_t suit_cards = copy_cards & suit_masks_[suit];
+		uint32_t mask = suit_cards & ~(suit_cards >> 1);
+		//represents out of the stategically inequivalent cards in a suit that a player holds, what rank is it, rank 0 is highest rank etc//
+		int suit_rank = __popcnt(_bzhi_u32(mask, action.index));
+		ApplyAction(action);
+		std::vector<Action> moves = LegalActions();
+		UndoAction(action);
+		int sum = 0;
+		for (size_t i = 0; i < moves.size(); ++i) {
+			sum += Trick(action, moves[i]);
+		}
+		if (sum == moves.size()) {
+			return action.suit == trump_ ? 0 - suit_rank : -1 * kNumRanks - suit_rank;//intriguing this seems to produce small perfomance increase//
+		}
+		if (sum == 0) {
+			return 2 * kNumRanks - suit_rank;
+		}
+		else {
+			return 1 * kNumRanks - suit_rank;
+		}
+	}
+	int FollowOrdering(Action action) {
+		Action lead = history_.back();
+		//follow ordering for fast cut offs//
+		//win as cheaply as possible, followed by lose as cheaply as possible
+		char suit = action.suit;
+		uint32_t copy_cards = cards_;
+		if (player_ == 0) {
+			copy_cards = ~copy_cards;
+		}
+		uint32_t suit_cards = copy_cards & suit_masks_[suit];
+		uint32_t mask = suit_cards & ~(suit_cards >> 1);
+		//represents out of the stategically inequivalent cards in a suit that a player holds, what rank is it, rank 0 is highest rank etc//
+		int suit_rank = __popcnt(_bzhi_u32(mask, action.index));
+		if (!Trick(lead, action)) {
+			return -kNumRanks - suit_rank;
+		}
+		else {
+			return -suit_rank;
+		}
+	}
+	
+	
+
+	std::vector<Action> LegalActions() {
+		//Features//
+		//strategically equivalent move fusion, no move ordering, for testing purposes//
+		std::vector<Action> out;
+		out.reserve(kNumRanks);
+		uint32_t copy_cards = cards_;
+		std::array<uint32_t, kNumSuits> player_suit_masks;
+		if (player_ == 0) {
+			copy_cards = ~copy_cards;
+		}
+		for (size_t i = 0; i < kNumSuits; ++i) {
+			uint32_t suit_cards = copy_cards & suit_masks_[i];
+			player_suit_masks[i] = suit_cards & ~(suit_cards >> 1);
+#ifdef DEBUG
+			std::cout << "Cards " << cards_ << std::endl;
+			std::cout << "Suit Mask " << i << " " << suit_masks_[i] << std::endl;
+			std::cout << "Player " << player_ << " suit mask " << (int)i << " " << player_suit_masks[i] << std::endl;
+#endif
+		}
+		std::vector<ActionValue> temp;
+		temp.reserve(kNumRanks);
+		for (char i = 0; i < kNumSuits; ++i) {
+			uint32_t suit_mask = player_suit_masks[i];
+			bool lead = (moves_ % 2 == 0);
+			bool follow = (moves_ % 2 == 1);
+			bool correct_suit = 0;
+			bool void_in_suit = 0;
+			if (follow == true) {
+				correct_suit = (history_.back().suit == i);
+				void_in_suit = (player_suit_masks[history_.back().suit] == 0);
+			}
+			if ((lead || (follow && (correct_suit || void_in_suit)))) {
+				while (suit_mask != 0) {
+					uint32_t best = _tzcnt_u32(suit_mask);
+					//out.push_back(Action(best, i, player_));
+					//temp.push_back({ Action(best,i,player_),MoveOrdering(Action(best,i,player_)) });
+					if (moves_ % 2 == 0) {
+						temp.push_back({ Action(best, i, player_),LeadOrdering(Action(best, i, player_)) });
+					}
+					else {
+						temp.push_back({ Action(best, i, player_),FollowOrdering(Action(best, i, player_)) });
+					}
+					suit_mask = _blsr_u32(suit_mask);
+				}
+			}
+		}
+		std::sort(temp.begin(), temp.end());
+		for (size_t i = 0; i < temp.size(); ++i) {
+			out.push_back(temp[i].action);
+		}
+		
+#ifdef DEBUG
+		std::cout << "Player " << player_ << " MoveGen " << std::endl;
+		for (size_t i = 0; i < out.size(); ++i) {
+			std::cout << out[i].index << " " << (int)out[i].suit << std::endl;
+		}
+#endif
+		return out;
+	}
+	void ApplyAction(Action action) {
+		#ifdef DEBUG
+			std::cout << "Player " << player_ << " ApplyAction " << action.index << " " << (int)action.suit << std::endl;
+		#endif  
+		if (moves_ % 2 == 1) {
+			Action lead = history_.back();
+			bool winner = !((Trick(lead, action)) ^ lead.player);
+		#ifdef DEBUG
+			std::cout << "Player " << winner << " won this trick" << std::endl;
+		#endif
+			score_ += (winner == 0);
+			player_ = (winner);
+		}
+		else {
+			player_ = !player_;
+		}
+		#ifdef DEBUG
+			assert((suit_masks_[0] & suit_masks_[1]) == 0);
+			assert((suit_masks_[0] & suit_masks_[2])== 0);
+			assert((suit_masks_[0] & suit_masks_[3]) == 0);
+			assert((suit_masks_[1] & suit_masks_[2]) == 0);
+			assert((suit_masks_[1] & suit_masks_[3]) == 0);
+			assert((suit_masks_[2] & suit_masks_[3]) == 0);
+		#endif
+		RemoveCard(action);
+		moves_++;
+		history_.push_back(action);
+	}
+	void UndoAction(Action action) {
+		if (moves_ % 2 == 0) {
+			Action lead = history_[history_.size() - 2];
+			Action follow = history_[history_.size() - 1];
+			bool winner = !(Trick(lead, follow) ^ lead.player);
+			score_ -= (winner == 0);
+		}
+		InsertCard(action);
+		moves_--;
+		player_=history_.back().player;
+		history_.pop_back();
+		#ifdef DEBUG
+			std::cout << "Player " << player_ << " UndoAction " << action.index << " " << (int)action.suit << std::endl;
+		#endif
+	}
+};
+
+
+
+//solvers below
+int AlphaBeta(Node* node, int alpha, int beta, int& counter) {
+	//counter tracks number of calls to search//
+	//fail soft ab search
+	counter++;
+	if (node->IsTerminal()) {
+		return node->Score();
+	}
+	else if (node->Player() == 0) {
+		int val = 0;
+		std::vector<Action> actions = node->LegalActions();
+		for (int i = 0; i < actions.size(); ++i) {
+			node->ApplyAction(actions[i]);
+			val = std::max(val, AlphaBeta(node, alpha, beta, counter));
+			node->UndoAction(actions[i]);
+			alpha = std::max(val, alpha);
+			if (val >= beta) {
+				break;
+			}
+		}
+		return val;
+	}
+	else if (node->Player() == 1) {
+		int val =kNumRanks;
+		std::vector<Action> actions = node->LegalActions();
+		for (int i = 0; i < actions.size(); ++i) {
+			node->ApplyAction(actions[i]);
+			val = std::min(val, AlphaBeta(node, alpha, beta, counter));
+			node->UndoAction(actions[i]);
+			beta = std::min(val, beta);
+			if (val <= alpha) {
+				break;
+			}
+		}
+		return val;
+	}
+	return -1;
+};
+
+
+
+//Helper Functions//
+std::vector<uint32_t> GenQuads(int size_endgames) {
+	//Generates Suit splittings for endgames of a certain size//
+	std::vector<uint32_t> v;
+	for (char i = 0; i <= std::min(size_endgames * 2, kNumRanks); ++i) {
+		int sum = size_endgames * 2 - i;
+		for (char j = 0; j <= std::min(sum, kNumRanks); ++j) {
+			for (char k = std::max((int)j, sum - j - kNumRanks); k <= std::min(sum - j, kNumRanks); ++k) {
+				char l = sum - j - k;
+				if (l < k) {
+					break;
+				}
+				else {
+					uint32_t num = 0;
+					num = num | (i);
+					num = num | (j << 4);
+					num = num | (k << 8);
+					num = num | (l << 12);
+					v.push_back(num);
+				}
+			}
+		}
+	}
+	return v;
+}
+std::vector<std::vector<uint32_t>> BinCoeffs(uint32_t max_n) {
+	//tabulates binomial coefficients//
+	std::vector<std::vector<uint32_t>> C(max_n+1,std::vector<uint32_t>(max_n+1));
+	for (uint32_t i = 1; i <= max_n; ++i) {
+		C[0][i] = 0;
+	}
+	for (uint32_t i = 0; i <= max_n; ++i) {
+		C[i][0] = 1;
+	}
+	for (uint32_t i = 1; i <= max_n; ++i) {
+		for (uint32_t j = 1; j <= max_n; ++j) {
+			C[i][j] = C[i - 1][j] + C[i - 1][j - 1];
+		}
+	}
+	return C;
+}
+
+uint32_t HalfColexer(uint32_t cards,std::vector<std::vector<uint32_t>>& bin_coeffs) {
+	//returns the colexicographical ranking of a combination of indices where the the size of the combination is half that of the set of indices//
+	uint32_t out = 0;
+	uint32_t count = 0;
+	while (cards != 0) {
+		uint32_t ind = _tzcnt_u32(cards);
+		uint32_t val = bin_coeffs[ind][count+1];
+		out += val;
+		cards = _blsr_u32(cards);
+		count++;
+	}
+	return out;
+}
+
+void GenSuitRankingsRel(uint32_t size, std::unordered_map<uint32_t, uint32_t>* Ranks) {
+	//Generates ranking Table for suit splittings for endgames of a certain size//
+	std::vector<uint32_t> v=GenQuads(size);
+	for (uint32_t i = 0; i < v.size(); ++i) {
+		std::cout << "GenSuitRanks " << v[i] << "  " << i << std::endl;
+		Ranks->insert({ v[i],i });
+	}
+}
+
+void GenSuitRankingsAbs(uint32_t suit_split,std::unordered_map<uint32_t,uint32_t>* Ranks) {
+	//Generates ranking table for all suit splittings//
+	uint32_t counter;
+	for (int i = 1; i <= kNumRanks; ++i) {
+		std::vector<uint32_t> v = GenQuads(2 * i);
+		for (int j = 0; j < v.size(); ++j) {
+			Ranks->insert({ v[j],counter });
+			counter++;
+		}
+	}
+}
+
+
+//struct for packed bounds can hold two numbers up to 15//
+struct PackedBounds {
+	char bounds;
+	void SetLower(char lower) {
+		bounds = bounds & 0b11110000;
+		bounds = bounds |(lower+1);
+	}
+	void SetUpper(char upper) {
+		bounds = bounds & 0b00001111;
+		bounds = bounds | ((upper+1) << 4);
+	}
+	char GetLower() {
+		return (bounds & 0b00001111)-1;
+	}
+	char GetUpper() {
+		return(((bounds & 0b11110000) >> 4)-1);
+	}
+	bool Empty() {
+		return bounds == 0;
+	}
+};
+//used for retrosolving(minimal size container)//
+//vector of chars but is really a wrapper for a vector of nybbles
+class vectorNa {
+private:
+	std::vector<char> data;
+public:
+	vectorNa(size_t num, char val) {
+		data = std::vector<char>((num >> 1)+1, val);
+	}
+	char operator[](size_t index){
+		int remainder = index & 0b1;
+		return (remainder == 0) ? (0b1111 & data[index>>1]) : ((0b11110000 & data[index>>1]) >> 4);
+	}
+	void Set(size_t index,char value){
+		int remainder = index & 0b1;
+		if (remainder == 0) {
+			char datastore = 0b11110000 & data[index>>1];
+			data[index>>1] = datastore + value;
+		}
+		else {
+			char datastore = (0b1111 & data[index >> 1]);
+			data[index >> 1] = datastore + (value << 4);
+		}
+	}
+};
+    
+  
+struct Bounds {
+	char lower;
+	char upper;
+};
+  
+char AlphaBetaMemory(Node* node, char alpha, char beta, int& counter, std::unordered_map<uint64_t, Bounds>* TTable) {
+	//counter tracks number of calls to search//
+	//fail soft ab search
+	char val = 0;
+	uint64_t key = 0;
+	if (node->IsTerminal()) {
+		return node->Score();
+	}
+	if(node->Moves()%2==0){
+		node->UpdateNodeKey();
+		key = node->GetNodeKey();
+		if (TTable->find(key) == TTable->end()) {
+			TTable->insert({ key,{0,node->RemainingTricks()} });
+			counter++;
+		}
+		char lower = TTable->at(key).lower;
+		char upper = TTable->at(key).upper;
+		if (lower == upper) {
+			return node->Score() +lower;
+		}
+		if (lower + node->Score() >= beta) {
+			return lower + node->Score();
+		}
+		if (upper + node->Score() <= alpha) {
+			return upper + node->Score();
+		}
+		alpha = std::max(alpha,(char)(lower + node->Score()));
+		beta = std::min(beta,(char)(upper + node->Score()));
+	}
+	
+	if (node->Player() == 0) {
+		val = node->Score();
+		char a = alpha;
+		std::vector<Action> actions;
+		actions = node->LegalActions();
+		for (int i = 0; i < actions.size(); ++i) {
+			node->ApplyAction(actions[i]);
+			val = std::max(val, AlphaBetaMemory(node, a, beta, counter, TTable));
+			node->UndoAction(actions[i]);
+			a = std::max(val, a);
+			if (val >= beta) {
+				break;
+			}
+		}
+	}
+	else if (node->Player() == 1) {
+		val = node->RemainingTricks()+node->Score();
+		char b = beta;
+		std::vector<Action> actions;
+		actions = node->LegalActions();
+		for (int i = 0; i < actions.size(); ++i) {
+			node->ApplyAction(actions[i]);
+			val = std::min(val, AlphaBetaMemory(node, alpha, b, counter, TTable));
+			node->UndoAction(actions[i]);
+			b = std::min(val, b);
+			if (val <= alpha) {
+				break;
+			}
+		}
+	}
+	if (val <= alpha && node->Moves() % 2 == 0) {
+		TTable->at(key).upper = val - node->Score();
+	}
+	if (val > alpha && val < beta && node->Moves() % 2 == 0) {
+		TTable->at(key).upper = val - node->Score();
+		TTable->at(key).lower = val - node->Score();
+	}
+	if (val >= beta && node->Moves() % 2 == 0) {
+		TTable->at(key).lower = val - node->Score();
+	}
+	return val;
+};
+
+char AlphaBetaMemoryIso(Node* node, char alpha, char beta, int& counter, std::unordered_map<uint64_t, Bounds>* TTable) {
+	//counter tracks number of calls to search//
+	//fail soft ab search
+	char val = 0;
+	uint64_t key = 0;
+	bool player = node->Player();
+	if (node->IsTerminal()) {
+		return node->Score();
+	}
+	if (node->Moves() % 2 == 0) {
+		node->UpdateNodeKey();
+		key = (player) ?node->AltKey(): node->GetNodeKey();
+		if (TTable->find(key) == TTable->end()) {
+			counter++;
+			TTable->insert({ key,{0,node->RemainingTricks()} });
+		}
+		char lower = (player)?node->RemainingTricks()-TTable->at(key).upper:TTable->at(key).lower;
+		char upper = (player)? node->RemainingTricks() - TTable->at(key).lower :TTable->at(key).upper;
+		if (lower == upper) { 
+			return node->Score() + lower;
+		}
+		if (lower + node->Score() >= beta) {
+			return lower + node->Score();
+		}
+		if (upper + node->Score() <= alpha) {
+			return upper + node->Score();
+		}
+		alpha = std::max(alpha, (char)(lower + node->Score()));
+		beta = std::min(beta, (char)(upper + node->Score()));
+	}
+
+	if (node->Player() == 0) {
+		val = node->Score();
+		char a = alpha;
+		std::vector<Action> actions;
+		actions = node->LegalActions();
+		for (int i = 0; i < actions.size(); ++i) {
+			node->ApplyAction(actions[i]);
+			val = std::max(val, AlphaBetaMemoryIso(node, a, beta, counter, TTable));
+			node->UndoAction(actions[i]);
+			a = std::max(val, a);
+			if (val >= beta) {
+				break;
+			}
+		}
+	}
+	else if (node->Player() == 1) {
+		val = node->RemainingTricks() + node->Score();
+		char b = beta;
+		std::vector<Action> actions;
+		actions = node->LegalActions();
+		for (int i = 0; i < actions.size(); ++i) {
+			node->ApplyAction(actions[i]);
+			val = std::min(val, AlphaBetaMemoryIso(node, alpha, b, counter, TTable));
+			node->UndoAction(actions[i]);
+			b = std::min(val, b);
+			if (val <= alpha) {
+				break;
+			}
+		}
+	}
+	if (val <= alpha && node->Moves() % 2 == 0) {
+		if (player) {
+			TTable->at(key).lower = node->RemainingTricks() - (val - node->Score());
+		}
+		else {
+			TTable->at(key).upper = val - node->Score();
+		}
+	}
+	if (val > alpha && val < beta && node->Moves() % 2 == 0) {
+		if (player) {
+			TTable->at(key).lower = node->RemainingTricks() - (val - node->Score());
+			TTable->at(key).upper = node->RemainingTricks() - (val - node->Score());
+		}
+		else {
+			TTable->at(key).upper = val - node->Score();
+			TTable->at(key).lower = val - node->Score();
+		}
+	}
+	if (val >= beta && node->Moves() % 2 == 0) {
+		if (player) {
+			TTable->at(key).upper = node->RemainingTricks() - (val - node->Score());
+		}
+		else {
+			TTable->at(key).lower = val - node->Score();
+		}
+	}
+	return val;
+};
+
+
+char MTD(Node* node,char guess, int& counter, std::unordered_map<uint64_t,Bounds>* TTable) {
+	char g = guess;
+	char upperbound =node->TotalTricks();
+	char lowerbound = 0;
+	while (lowerbound < upperbound) {
+		char beta;
+		(g == lowerbound) ? beta = g + 1 : beta = g;
+		g = AlphaBetaMemoryIso(node, beta - 1, beta, counter, TTable);
+		(g < beta) ? upperbound = g : lowerbound = g;
+	}
+	return g;
+}
+
+char IncrementalAlphaBetaMemoryIso(Node* node, char alpha, char beta, int& counter,int depth, std::vector<vectorNa>* TTable,std::unordered_map<uint32_t,uint32_t>* SuitRanks, std::vector<std::vector<uint32_t>>& bin_coeffs) {
+	//counter tracks number of calls to search//
+	//fail soft ab search
+	char val = 0;
+	uint64_t key = 0;
+	bool player = node->Player();
+	//std::cout << " HI " << node->IsTerminal() << " " << (int)node->Moves() << std::endl;
+	if (node->IsTerminal()) {
+		return node->Score();
+	}
+	if (node->Moves() % 2 == 0&& depth==0) {
+		node->UpdateNodeKey();
+		key = (player) ? node->AltKey() : node->GetNodeKey();
+		uint32_t cards = key & _bzhi_u64(~0, 32);
+		uint32_t colex = HalfColexer(cards, bin_coeffs);
+		uint32_t suits = (key & (~0 ^ _bzhi_u64(~0, 32))) >> 32;
+		//if (node->TotalTricks() == kNumRanks) {
+			//std::cout << "Calculating Rank" << std::endl;
+			//std::cout << "sUITS " << suits << std::endl;
+		//}
+		uint32_t suit_rank = SuitRanks->at(suits);
+		char value = (player) ? node->RemainingTricks() - TTable->at(colex)[suit_rank] : TTable->at(colex)[suit_rank];
+		return value;
+	}
+
+	if (node->Player() == 0) {
+		val = node->Score();
+		char a = alpha;
+		std::vector<Action> actions;
+		actions = node->LegalActions();
+		for (int i = 0; i < actions.size(); ++i) {
+			node->ApplyAction(actions[i]);
+			val = std::max(val, IncrementalAlphaBetaMemoryIso(node, a, beta, counter,depth-1, TTable,SuitRanks,bin_coeffs));
+			node->UndoAction(actions[i]);
+			a = std::max(val, a);
+			if (val >= beta) {
+				break;
+			}
+		}
+	}
+	else if (node->Player() == 1) {
+		val = node->RemainingTricks() + node->Score();
+		char b = beta;
+		std::vector<Action> actions;
+		actions = node->LegalActions();
+		for (int i = 0; i < actions.size(); ++i) {
+			node->ApplyAction(actions[i]);
+			val = std::min(val, IncrementalAlphaBetaMemoryIso(node, alpha, b, counter,depth-1, TTable,SuitRanks,bin_coeffs));
+			node->UndoAction(actions[i]);
+			b = std::min(val, b);
+			if (val <= alpha) {
+				break;
+			}
+		}
+	}
+	
+	return val;
+};
+
+
+char IncrementalMTD(Node* node, char guess,int depth,int& counter, std::vector<vectorNa>* TTable,std::unordered_map<uint32_t,uint32_t>* SuitRanks,std::vector<std::vector<uint32_t>>& bin_coeffs) {
+	char g = guess;
+	char upperbound = node->TotalTricks();
+	char lowerbound = 0;
+	while (lowerbound < upperbound) {
+		char beta;
+		(g == lowerbound) ? beta = g + 1 : beta = g;
+		g = IncrementalAlphaBetaMemoryIso(node, beta - 1, beta, counter,depth,TTable,SuitRanks, bin_coeffs);
+		(g < beta) ? upperbound = g : lowerbound = g;
+	}
+	return g;
+}
+ std::vector<Node> GWhistGenerator(int num,unsigned int seed){
+	 //generates pseudorandom endgames//
+	 std::vector<Node> out;
+	 out.reserve(num);
+	 std::mt19937 g(seed);
+	 std::array<int, 2 * kNumRanks> nums;
+	 for (int i = 0; i < 2 * kNumRanks; ++i) {
+		 nums[i] = i;
+	 }
+	 for (int i = 0; i < num; ++i) {
+		 std::shuffle(nums.begin(), nums.end(), g);
+		 uint32_t cards = 0;
+		 std::array<uint32_t, kNumSuits> suits;
+		 for (int j = 0; j < kNumRanks; ++j) {
+			 cards = cards | (1 << nums[j]);
+		 }
+		 std::shuffle(nums.begin(), nums.end(), g);
+		 std::array<char, kNumSuits> temp;
+		 for (int j = 0; j < kNumSuits-1; ++j) {
+			 temp[j] = nums[j];
+		 }
+		 temp[kNumSuits - 1] = 2 * kNumRanks;
+		 std::sort(temp.begin(), temp.end());
+		 for (int j = 0; j < kNumSuits; ++j) {
+			 if (j == 0) {
+				 suits[j] = _bzhi_u32(~0, temp[j]);
+			 }
+			 else {
+				 suits[j] = (_bzhi_u32(~0, temp[j])) ^ _bzhi_u32(~0, temp[j-1]);
+				 //assert((suits[j] & suits[j - 1])== 0);
+			 }
+		 }
+		 out.push_back(Node(cards, suits, 0,false));
+		#ifdef DEBUG
+		 std::cout << __popcnt(cards) << " " << __popcnt(suits[0]) + __popcnt(suits[1]) + __popcnt(suits[2]) + __popcnt(suits[3]) << std::endl;
+		 std::cout << cards << " " << suits[0] << " " << suits[1] << " " << suits[2] << " " << suits[3] << std::endl;
+		#endif
+
+	 }
+	 return out;
+ }
+
+ bool next_combination(std::vector<int>& a, int n) {
+	 //generates the next combination of on bits in cards_ for endgame generation//
+	 int k = (int)a.size();
+	 for (int i = k - 1; i >= 0; i--) {
+		 if (a[i] < n - k + i) {
+			 a[i]++;
+			 for (int j = i + 1; j < k; j++)
+				 a[j] = a[j - 1] + 1;
+			 return true;
+		 }
+	 }
+	 return false;     
+ }
+
+ void CacheSeeding(int size_endgames, int& counter, bool safe, std::unordered_map<uint64_t, Bounds>* TTable) {
+	 //first generate all possible suit splittings//
+	 //needs modifying//
+	 std::vector<uint32_t> suit_splits = GenQuads(size_endgames);
+	 std::vector<int> combination;
+	 combination.reserve(size_endgames);
+	 for (int i = 0; i < size_endgames; ++i) {
+		 combination.push_back(i);
+	 }
+	 bool val = true;
+	 while (val) {
+		 uint32_t cards = 0;
+		 for (int i = 0; i < combination.size(); ++i) {
+			 cards = (cards | (1 << combination[i]));
+		 }
+		 for (int i = 0; i < suit_splits.size(); ++i) {
+			 std::array<uint32_t, kNumSuits> suit_arr;
+			 suit_arr[0] = _bzhi_u32(~0, suit_splits[i]&0b1111);
+			 int sum = suit_splits[i]&0b1111;
+			 for (int j = 1; j < kNumSuits; ++j) {
+				 uint32_t mask = _bzhi_u32(~0, sum);
+				 sum += suit_splits[i]&(0b1111<<(4*j));
+				 suit_arr[j] = _bzhi_u32(~0, sum);
+				 suit_arr[j] = suit_arr[j] ^ mask;
+			 }
+			 Node node(cards, suit_arr, 0, false);
+			 MTD(&node, (size_endgames >> 1), counter, TTable);
+			 
+		 }
+		 val = next_combination(combination, size_endgames * 2);
+	 }
+ }
+
+ std::vector<vectorNa> InitialiseTTable(int size,std::vector<std::vector<uint32_t>>& bin_coeffs) {
+	 //initialises TTable for a certain depth//
+	 size_t suit_size = GenQuads(size).size();
+	 return std::vector<vectorNa>(bin_coeffs[2 * size][size], vectorNa(suit_size, 0));
+ }
+
+ std::vector<vectorNa> RetroSolver(int size_endgames,std::vector<vectorNa>* TTable, int& counter,std::vector<std::vector<uint32_t>>& bin_coeffs) {
+	 //takes endgames solved to depth d and returns endgames solved to depth d+1//
+	 std::vector<vectorNa> outTTable = InitialiseTTable(size_endgames, bin_coeffs);
+	 std::vector<uint32_t> suit_splits = GenQuads(size_endgames);
+	 std::unordered_map<uint32_t, uint32_t> SuitRanks;
+	 GenSuitRankingsRel(size_endgames-1,&SuitRanks);
+	 std::vector<int> combination;
+	 combination.reserve(size_endgames);
+	 for (int i = 0; i < size_endgames ; ++i) {
+		 combination.push_back(i);
+	 }
+	 bool val = true;
+	 int count = 0;
+	 while (val) {
+		 uint32_t cards = 0;
+		 for (int i = 0; i < combination.size(); ++i) {
+			 cards = (cards | (1 << combination[i]));
+		 }
+		 #pragma omp parallel for
+		 for (int i = 0; i < suit_splits.size(); ++i) {
+			 std::array<uint32_t, kNumSuits> suit_arr;
+			 suit_arr[0] = _bzhi_u32(~0, suit_splits[i] & 0b1111);
+			 int sum = suit_splits[i] & 0b1111;
+			 for (int j = 1; j < kNumSuits; ++j) {
+				 uint32_t mask = _bzhi_u32(~0, sum);
+				 sum += (suit_splits[i] & (0b1111 << (4 * j)))>>4*j;
+				 suit_arr[j] = _bzhi_u32(~0, sum);
+				 suit_arr[j] = suit_arr[j] ^ mask;
+			 }
+			 Node node(cards, suit_arr, 0, false);
+			 char result = IncrementalMTD(&node, (size_endgames >> 1),2, counter, TTable,&SuitRanks,bin_coeffs);
+			 outTTable[count].Set(i, result);
+		 }
+		 val = next_combination(combination, size_endgames * 2);
+		 count++;
+	 }
+	 return outTTable;
+ }
+ //DONE //
+ //MOVE ORDERING, STRATEGIC MOVE FUSION, ALPHA BETA PRUNING, TRANSPOSITION TABLE, RANDOM ENDGAME GENERATION//
+ //CORRECT ALPHABETAMEMORY SEARCH//
+ //CACHE SEEDING//
+ // SEARCH TAKING ADVANTAGE OF PLAYER ISOMORPHISM//
+ // 
+ //
+ //TO IMPLEMENT/ISSUES //
+ //
+ //MUST ADDRESS//
+ //CACHE OVERFLOW//
+ //FORMAL TESTS//
+ //ZERO SUM SCORING//
+ // CODE CLEANUP//  
+ //
+ //OPTIMISATIONS//
+
+int main() {
+	uint32_t cards = 0b10101010110100100011111000;
+	std::array<uint32_t, kNumSuits> suits = { 0b111111,0b1111111000000,0b1111110000000000000,0b11111110000000000000000000};
+	int counter = 0;
+	std::vector<Node> nodes = GWhistGenerator(1000, 1000);
+	std::unordered_map<uint64_t,Bounds> TTable1 = {};
+	std::unordered_map<uint64_t, Bounds> TTable2 = {};
+	std::cout << TTable1.max_size() << std::endl;
+	std::cout << TTable2.max_size() << std::endl;
+	std::vector<int> results = {};
+	auto start = std::chrono::high_resolution_clock::now();
+	int inconsistent = 0;
+	int counter1 = 0;
+	std::unordered_map<uint32_t, uint32_t> SuitRanks;
+	GenSuitRankingsRel(8,&SuitRanks);
+	std::vector<vectorNa> v;
+	std::vector<std::vector<uint32_t>> bin_coeffs = BinCoeffs(2 * kNumRanks);
+	for (int i = 1; i <= 8; ++i) {
+		std::vector<vectorNa>new_v = RetroSolver(i, &v, counter1, bin_coeffs);
+		v = new_v;
+		std::cout << "Done " << i << std::endl;
+	}
+	auto stop = std::chrono::high_resolution_clock::now();
+	auto start1 = std::chrono::high_resolution_clock::now();
+	for (auto it = nodes.begin(); it != nodes.end(); ++it) {
+		//char abm_unsafe =MTD(&*it,6, counter1, &TTable2);
+		char abm_unsafe = IncrementalMTD(&*it, 6, 10, counter1, &v, &SuitRanks, bin_coeffs);
+	}
+	auto stop1= std::chrono::high_resolution_clock::now();
+	auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start);
+	std::cout << counter << std::endl;
+	std::cout << counter1 << std::endl;
+	std::cout << inconsistent << std::endl;
+	std::cout <<duration.count() << std::endl;
+	auto duration1 = std::chrono::duration_cast<std::chrono::milliseconds>(stop1 - start1);
+	std::cout << duration1.count() << std::endl;
+	std::cout << " Collisions " << TTable2.bucket_count() - TTable2.size() << std::endl;
+
+	std::vector<uint32_t> vec = GenQuads(8);
+	for (int i = 0; i < vec.size(); ++i) {
+		std::cout << (int)(vec[i]&0b1111) << " " << (int)((vec[i]&0b11110000)>>4) << " " <<(int)((vec[i]&0b111100000000)>>8) << " " <<(int)((vec[i]&0b1111000000000000)>>12) << std::endl;
+	} 
+	//std::vector<int> ints;
+	//for (int i = 0; i < 2; ++i) {
+		//ints.push_back(i);
+	//}
+	//std::cout << vec.size() << std::endl;
+	
+}

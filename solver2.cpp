@@ -2,8 +2,6 @@
 //  main.cpp
 //  GermanWhist
 //
-//  Created by Thomas McGowan on 26/11/2023.
-//
 
 #include <vector>
 #include <algorithm>

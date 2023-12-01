@@ -2,7 +2,6 @@
 //  main.cpp
 //  GermanWhist
 //
-
 #include <vector>
 #include <algorithm>
 #include <unordered_map>
@@ -13,6 +12,8 @@
 #include <cassert>
 #include <random>
 #include <ratio>
+#include <fstream>
+#include <string>
 //#include <omp.h>
   
 //#define DEBUG
@@ -261,7 +262,7 @@ public:
 
     std::vector<Action> LegalActions() {
         //Features//
-        //strategically equivalent move fusion, no move ordering, for testing purposes//
+        //Move fusion and move ordering//
         std::vector<Action> out;
         out.reserve(kNumRanks);
         uint32_t copy_cards = cards_;
@@ -293,8 +294,6 @@ public:
             if ((lead || (follow && (correct_suit || void_in_suit)))) {
                 while (suit_mask != 0) {
                     uint32_t best = _tzcnt_u32(suit_mask);
-                    //out.push_back(Action(best, i, player_));
-                    //temp.push_back({ Action(best,i,player_),MoveOrdering(Action(best,i,player_)) });
                     if (moves_ % 2 == 0) {
                         temp.push_back({ Action(best, i, player_),LeadOrdering(Action(best, i, player_)) });
                     }
@@ -366,10 +365,8 @@ public:
 
 
 //solvers below
-int AlphaBeta(Node* node, int alpha, int beta, int& counter) {
-    //counter tracks number of calls to search//
+int AlphaBeta(Node* node, int alpha, int beta) {
     //fail soft ab search
-    counter++;
     if (node->IsTerminal()) {
         return node->Score();
     }
@@ -378,7 +375,7 @@ int AlphaBeta(Node* node, int alpha, int beta, int& counter) {
         std::vector<Action> actions = node->LegalActions();
         for (int i = 0; i < actions.size(); ++i) {
             node->ApplyAction(actions[i]);
-            val = std::max(val, AlphaBeta(node, alpha, beta, counter));
+            val = std::max(val, AlphaBeta(node, alpha, beta));
             node->UndoAction(actions[i]);
             alpha = std::max(val, alpha);
             if (val >= beta) {
@@ -392,7 +389,7 @@ int AlphaBeta(Node* node, int alpha, int beta, int& counter) {
         std::vector<Action> actions = node->LegalActions();
         for (int i = 0; i < actions.size(); ++i) {
             node->ApplyAction(actions[i]);
-            val = std::min(val, AlphaBeta(node, alpha, beta, counter));
+            val = std::min(val, AlphaBeta(node, alpha, beta));
             node->UndoAction(actions[i]);
             beta = std::min(val, beta);
             if (val <= alpha) {
@@ -531,28 +528,6 @@ void GenSuitRankingsAbs(uint32_t suit_split,std::unordered_map<uint32_t,uint32_t
     }
 }
 
-
-//struct for packed bounds can hold two numbers up to 15//
-struct PackedBounds {
-    char bounds;
-    void SetLower(char lower) {
-        bounds = bounds & 0b11110000;
-        bounds = bounds |(lower+1);
-    }
-    void SetUpper(char upper) {
-        bounds = bounds & 0b00001111;
-        bounds = bounds | ((upper+1) << 4);
-    }
-    char GetLower() {
-        return (bounds & 0b00001111)-1;
-    }
-    char GetUpper() {
-        return(((bounds & 0b11110000) >> 4)-1);
-    }
-    bool Empty() {
-        return bounds == 0;
-    }
-};
 //used for retrosolving(minimal size container)//
 //vector of chars but is really a wrapper for a vector of nybbles
 class vectorNa {
@@ -562,9 +537,15 @@ public:
     vectorNa(size_t num, char val) {
         data = std::vector<char>((num >> 1)+1, val);
     }
-    char operator[](size_t index){
-        int remainder = index & 0b1;
-        return (remainder == 0) ? (0b1111 & data[index>>1]) : ((0b11110000 & data[index>>1]) >> 4);
+    //OPERATOR OVERLOADS ACCESS RAW VECTOR OF CHARS//
+    size_t size() const{
+        return data.size();
+    }
+    char const& operator[](size_t index) const{
+        return data[index];
+    }
+    void SetChar(size_t index, char value){
+        data[index]=value;
     }
     char Get(size_t index){
         int remainder = index&0b1;
@@ -594,8 +575,7 @@ struct Bounds {
     char upper;
 };
   
-char AlphaBetaMemory(Node* node, char alpha, char beta, int& counter, std::unordered_map<uint64_t, Bounds>* TTable) {
-    //counter tracks number of calls to search//
+char AlphaBetaMemory(Node* node, char alpha, char beta, std::unordered_map<uint64_t, Bounds>* TTable) {
     //fail soft ab search
     char val = 0;
     uint64_t key = 0;
@@ -607,7 +587,6 @@ char AlphaBetaMemory(Node* node, char alpha, char beta, int& counter, std::unord
         key = node->GetNodeKey();
         if (TTable->find(key) == TTable->end()) {
             TTable->insert({ key,{0,node->RemainingTricks()} });
-            counter++;
         }
         char lower = TTable->at(key).lower;
         char upper = TTable->at(key).upper;
@@ -631,7 +610,7 @@ char AlphaBetaMemory(Node* node, char alpha, char beta, int& counter, std::unord
         actions = node->LegalActions();
         for (int i = 0; i < actions.size(); ++i) {
             node->ApplyAction(actions[i]);
-            val = std::max(val, AlphaBetaMemory(node, a, beta, counter, TTable));
+            val = std::max(val, AlphaBetaMemory(node, a, beta, TTable));
             node->UndoAction(actions[i]);
             a = std::max(val, a);
             if (val >= beta) {
@@ -646,7 +625,7 @@ char AlphaBetaMemory(Node* node, char alpha, char beta, int& counter, std::unord
         actions = node->LegalActions();
         for (int i = 0; i < actions.size(); ++i) {
             node->ApplyAction(actions[i]);
-            val = std::min(val, AlphaBetaMemory(node, alpha, b, counter, TTable));
+            val = std::min(val, AlphaBetaMemory(node, alpha, b, TTable));
             node->UndoAction(actions[i]);
             b = std::min(val, b);
             if (val <= alpha) {
@@ -667,8 +646,7 @@ char AlphaBetaMemory(Node* node, char alpha, char beta, int& counter, std::unord
     return val;
 };
 
-char AlphaBetaMemoryIso(Node* node, char alpha, char beta, int& counter, std::unordered_map<uint64_t, Bounds>* TTable) {
-    //counter tracks number of calls to search//
+char AlphaBetaMemoryIso(Node* node, char alpha, char beta, std::unordered_map<uint64_t, Bounds>* TTable) {
     //fail soft ab search
     char val = 0;
     uint64_t key = 0;
@@ -680,7 +658,6 @@ char AlphaBetaMemoryIso(Node* node, char alpha, char beta, int& counter, std::un
         node->UpdateNodeKey();
         key = (player) ?node->AltKey(): node->GetNodeKey();
         if (TTable->find(key) == TTable->end()) {
-            counter++;
             TTable->insert({ key,{0,node->RemainingTricks()} });
         }
         char lower = (player)?node->RemainingTricks()-TTable->at(key).upper:TTable->at(key).lower;
@@ -705,7 +682,7 @@ char AlphaBetaMemoryIso(Node* node, char alpha, char beta, int& counter, std::un
         actions = node->LegalActions();
         for (int i = 0; i < actions.size(); ++i) {
             node->ApplyAction(actions[i]);
-            val = std::max(val, AlphaBetaMemoryIso(node, a, beta, counter, TTable));
+            val = std::max(val, AlphaBetaMemoryIso(node, a, beta, TTable));
             node->UndoAction(actions[i]);
             a = std::max(val, a);
             if (val >= beta) {
@@ -720,7 +697,7 @@ char AlphaBetaMemoryIso(Node* node, char alpha, char beta, int& counter, std::un
         actions = node->LegalActions();
         for (int i = 0; i < actions.size(); ++i) {
             node->ApplyAction(actions[i]);
-            val = std::min(val, AlphaBetaMemoryIso(node, alpha, b, counter, TTable));
+            val = std::min(val, AlphaBetaMemoryIso(node, alpha, b, TTable));
             node->UndoAction(actions[i]);
             b = std::min(val, b);
             if (val <= alpha) {
@@ -758,21 +735,20 @@ char AlphaBetaMemoryIso(Node* node, char alpha, char beta, int& counter, std::un
 };
 
 
-char MTD(Node* node,char guess, int& counter, std::unordered_map<uint64_t,Bounds>* TTable) {
+char MTD(Node* node,char guess, std::unordered_map<uint64_t,Bounds>* TTable) {
     char g = guess;
     char upperbound =node->TotalTricks();
     char lowerbound = 0;
     while (lowerbound < upperbound) {
         char beta;
         (g == lowerbound) ? beta = g + 1 : beta = g;
-        g = AlphaBetaMemoryIso(node, beta - 1, beta, counter, TTable);
+        g = AlphaBetaMemoryIso(node, beta - 1, beta, TTable);
         (g < beta) ? upperbound = g : lowerbound = g;
     }
     return g;
 }
 
-char IncrementalAlphaBetaMemoryIso(Node* node, char alpha, char beta, int& counter,int depth, std::vector<vectorNa>* TTable,std::unordered_map<uint32_t,uint32_t>* SuitRanks, std::vector<std::vector<uint32_t>>& bin_coeffs) {
-    //counter tracks number of calls to search//
+char IncrementalAlphaBetaMemoryIso(Node* node, char alpha, char beta,int depth, std::vector<vectorNa>* TTable,std::unordered_map<uint32_t,uint32_t>* SuitRanks, std::vector<std::vector<uint32_t>>& bin_coeffs) {
     //fail soft ab search
     char val = 0;
     uint64_t key = 0;
@@ -795,7 +771,7 @@ char IncrementalAlphaBetaMemoryIso(Node* node, char alpha, char beta, int& count
         std::vector<Action> actions = node->LegalActions();
         for (int i = 0; i < actions.size(); ++i) {
             node->ApplyAction(actions[i]);
-            val = std::max(val,IncrementalAlphaBetaMemoryIso(node, alpha, beta, counter,depth-1, TTable,SuitRanks,bin_coeffs));
+            val = std::max(val,IncrementalAlphaBetaMemoryIso(node, alpha, beta,depth-1, TTable,SuitRanks,bin_coeffs));
             node->UndoAction(actions[i]);
             alpha = std::max(val, alpha);
             if (val >= beta) {
@@ -808,7 +784,7 @@ char IncrementalAlphaBetaMemoryIso(Node* node, char alpha, char beta, int& count
         std::vector<Action> actions = node->LegalActions();
         for (int i = 0; i < actions.size(); ++i) {
             node->ApplyAction(actions[i]);
-            val = std::min(val, IncrementalAlphaBetaMemoryIso(node, alpha, beta, counter,depth-1, TTable,SuitRanks,bin_coeffs));
+            val = std::min(val, IncrementalAlphaBetaMemoryIso(node, alpha, beta,depth-1, TTable,SuitRanks,bin_coeffs));
             node->UndoAction(actions[i]);
             beta = std::min(val, beta);
             if (val <= alpha) {
@@ -820,14 +796,14 @@ char IncrementalAlphaBetaMemoryIso(Node* node, char alpha, char beta, int& count
 };
 
 
-char IncrementalMTD(Node* node, char guess,int depth,int& counter, std::vector<vectorNa>* TTable,std::unordered_map<uint32_t,uint32_t>* SuitRanks,std::vector<std::vector<uint32_t>>& bin_coeffs) {
+char IncrementalMTD(Node* node, char guess,int depth, std::vector<vectorNa>* TTable,std::unordered_map<uint32_t,uint32_t>* SuitRanks,std::vector<std::vector<uint32_t>>& bin_coeffs) {
     char g = guess;
     char upperbound = node->TotalTricks();
     char lowerbound = 0;
     while (lowerbound < upperbound) {
         char beta;
         (g == lowerbound) ? beta = g + 1 : beta = g;
-        g = IncrementalAlphaBetaMemoryIso(node, beta - 1, beta, counter,depth,TTable,SuitRanks, bin_coeffs);
+        g = IncrementalAlphaBetaMemoryIso(node, beta - 1, beta,depth,TTable,SuitRanks, bin_coeffs);
         (g < beta) ? upperbound = g : lowerbound = g;
     }
     return g;
@@ -891,54 +867,6 @@ char IncrementalMTD(Node* node, char guess,int depth,int& counter, std::vector<v
      }
      return out;
  }
-//this is very wrong because we are using colexicographic ranking, so we insert them in lexicographic order, then access them as if they are colexicographic == stupid.fix this
-//
- bool next_combination(std::vector<int>& a, int n) {
-     //generates the next combination of on bits in cards_ for endgame generation//
-     int k = (int)a.size();
-     for (int i = k - 1; i >= 0; i--) {
-         if (a[i] < n - k + i) {
-             a[i]++;
-             for (int j = i + 1; j < k; j++)
-                 a[j] = a[j - 1] + 1;
-             return true;
-         }
-     }
-     return false;
- }
-
- void CacheSeeding(int size_endgames, int& counter, bool safe, std::unordered_map<uint64_t, Bounds>* TTable) {
-     //first generate all possible suit splittings//
-     //needs modifying//
-     std::vector<uint32_t> suit_splits = GenQuads(size_endgames);
-     std::vector<int> combination;
-     combination.reserve(size_endgames);
-     for (int i = 0; i < size_endgames; ++i) {
-         combination.push_back(i);
-     }
-     bool val = true;
-     while (val) {
-         uint32_t cards = 0;
-         for (int i = 0; i < combination.size(); ++i) {
-             cards = (cards | (1 << combination[i]));
-         }
-         for (int i = 0; i < suit_splits.size(); ++i) {
-             std::array<uint32_t, kNumSuits> suit_arr;
-             suit_arr[0] = _bzhi_u32(~0, suit_splits[i]&0b1111);
-             int sum = suit_splits[i]&0b1111;
-             for (int j = 1; j < kNumSuits; ++j) {
-                 uint32_t mask = _bzhi_u32(~0, sum);
-                 sum += suit_splits[i]&(0b1111<<(4*j));
-                 suit_arr[j] = _bzhi_u32(~0, sum);
-                 suit_arr[j] = suit_arr[j] ^ mask;
-             }
-             Node node(cards, suit_arr, 0, false);
-             MTD(&node, (size_endgames >> 1), counter, TTable);
-             
-         }
-         val = next_combination(combination, size_endgames * 2);
-     }
- }
 
  std::vector<vectorNa> InitialiseTTable(int size,std::vector<std::vector<uint32_t>>& bin_coeffs) {
      //initialises TTable for a certain depth//
@@ -946,8 +874,8 @@ char IncrementalMTD(Node* node, char guess,int depth,int& counter, std::vector<v
      return std::vector<vectorNa>(bin_coeffs[2 * size][size], vectorNa(suit_size, 0));
  }
 
- std::vector<vectorNa> RetroSolver(int size_endgames,std::vector<vectorNa>* TTable, int& counter,std::vector<std::vector<uint32_t>>& bin_coeffs) {
-     //takes endgames solved to depth d and returns endgames solved to depth d+1//
+ std::vector<vectorNa> RetroSolver(int size_endgames,std::vector<vectorNa>* TTable,std::vector<std::vector<uint32_t>>& bin_coeffs) {
+     //takes endgames solved to depth d-1 and returns endgames solved to depth d //
      std::vector<vectorNa> outTTable = InitialiseTTable(size_endgames, bin_coeffs);
      std::vector<uint32_t> suit_splits = GenQuads(size_endgames);
      std::unordered_map<uint32_t, uint32_t> SuitRanks;
@@ -957,7 +885,6 @@ char IncrementalMTD(Node* node, char guess,int depth,int& counter, std::vector<v
      for (int i = 0; i < size_endgames ; ++i) {
          combination.push_back(i);
      }
-     uint32_t total_cards = bin_coeffs[2*size_endgames][size_endgames];
      bool control = true;
      int count = 0;
      while(control) {
@@ -965,7 +892,6 @@ char IncrementalMTD(Node* node, char guess,int depth,int& counter, std::vector<v
          for(int i=0;i<combination.size();++i){
              cards = cards|(1<<combination[i]);
          }
-         //uint32_t cards = HalfUnColexer(size_endgames,k,bin_coeffs);
          //#pragma omp parallel for
          for (int i = 0; i < suit_splits.size(); ++i) {
              std::array<uint32_t, kNumSuits> suit_arr;
@@ -978,7 +904,7 @@ char IncrementalMTD(Node* node, char guess,int depth,int& counter, std::vector<v
                  suit_arr[j] = suit_arr[j] ^ mask;
              }
              Node node(cards, suit_arr, 0, false);
-             char result = IncrementalMTD(&node, (size_endgames >> 1),2, counter, TTable,&SuitRanks,bin_coeffs);
+             char result = IncrementalMTD(&node, (size_endgames >> 1),2, TTable,&SuitRanks,bin_coeffs);
              outTTable[count].Set(i, result);
          }
          control = NextColex(combination,2*size_endgames);
@@ -986,83 +912,76 @@ char IncrementalMTD(Node* node, char guess,int depth,int& counter, std::vector<v
      }
      return outTTable;
  }
+
+bool TestRetroSolve(int samples,int depth, uint32_t seed,std::vector<std::vector<uint32_t>>&bin_coeffs){
+    //Tests endgame solution with TTable vs raw seach
+    std::vector<Node> nodes = GWhistGenerator(samples,seed);
+    std::vector<vectorNa> v;
+    for(int i =1;i<=depth;++i){
+        v=RetroSolver(i,&v,bin_coeffs);
+    }
+    std::unordered_map<uint32_t,uint32_t> SuitRanks ;
+    GenSuitRankingsRel(depth,&SuitRanks);
+    for (auto it = nodes.begin(); it != nodes.end(); ++it) {
+        char abm_unsafe = IncrementalMTD(&*it,6,2*(kNumRanks-depth), &v, &SuitRanks, bin_coeffs);
+        char abm_safe = AlphaBeta(&*it,0,kNumRanks);
+        if(abm_unsafe!=abm_safe){
+            return false;
+        }
+    }
+    return true;
+}
+
+void StoreTTable(const std::string filename, const std::vector<vectorNa>& solution){
+    //stores solution into a text file//
+    std::ofstream file(filename);
+    for(int i =0;i<solution.size();++i){
+        for(int j=0;j<solution[i].size();++j){
+            file.put(solution[i][j]);
+        }
+    }
+    file.close();
+}
+
+std::vector<vectorNa> LoadTTable(const std::string filename, int depth,std::vector<std::vector<uint32_t>>& bin_coeffs){
+    //loads solution from a text file into a vector for use//
+    std::vector<vectorNa> v = InitialiseTTable(depth,bin_coeffs);
+    std::ifstream file(filename,std::ios::binary);
+    size_t length = v[0].size();
+    char c;
+    for(int i =0;i<v.size();++i){
+        for(int j =0;j<length;++j){
+            file.get(c);
+            v[i].SetChar(j,c);
+        }
+    }
+    file.close();
+    return v;
+}
+
+bool TestTTableStorage(std::string filename, std::vector<vectorNa>& v,int depth,std::vector<std::vector<uint32_t>>& bin_coeffs){
+    //Tests storage fidelity//
+    StoreTTable(filename,v);
+    std::vector<vectorNa> new_v = LoadTTable(filename,depth,bin_coeffs);
+    for(int i =0;i<v.size();++i){
+        for(int j =0;j<v[i].size();++j){
+            if(v[i][j]!=new_v[i][j]){
+                return false;
+            }
+        }
+    }
+    return true;
+}
  //DONE //
  //MOVE ORDERING, STRATEGIC MOVE FUSION, ALPHA BETA PRUNING, TRANSPOSITION TABLE, RANDOM ENDGAME GENERATION//
  //CORRECT ALPHABETAMEMORY SEARCH//
- //CACHE SEEDING//
  //SEARCH TAKING ADVANTAGE OF PLAYER ISOMORPHISM//
- //RETROGRADE ANALYSIS
+ //RETROGRADE ANALYSIS//
+// SAVING& LOADING TTABLES TO THE COMPUTER//
  //
- //TO IMPLEMENT/ISSUES //
- //
- //
- //
- //OPTIMISATIONS//
-
-
-int main() {
-    uint32_t cards = 0b10101010110100100011111000;
-    std::array<uint32_t, kNumSuits> suits = { 0b111111,0b1111111000000,0b1111110000000000000,0b11111110000000000000000000};
-    int counter = 0;
-    std::vector<Node> nodes = GWhistGenerator(10000, 1000);
-    std::unordered_map<uint64_t,Bounds> TTable1 = {};
-    std::unordered_map<uint64_t, Bounds> TTable2 = {};
-    std::cout << TTable1.max_size() << std::endl;
-    std::cout << TTable2.max_size() << std::endl;
-    std::vector<int> results = {};
-    auto start = std::chrono::high_resolution_clock::now();
-    int inconsistent = 0;
-    int counter1 = 0;
-    std::unordered_map<uint32_t, uint32_t> SuitRanks;
-    GenSuitRankingsRel(10,&SuitRanks);
-    std::vector<vectorNa> v;
-    std::vector<std::vector<uint32_t>> bin_coeffs = BinCoeffs(2 * kNumRanks);
-    
-    std::vector<int> combination = {0,1,2,3,4};
-    for(int i =0;i<10;++i){
-        NextColex(combination,10);
-        for(int j =0;j<combination.size();++j){
-            std::cout<<combination[j];
-        }
-        std::cout<<std::endl;
-    }
-    for (int i = 1; i <= 10; ++i) {
-        std::vector<vectorNa>new_v = RetroSolver(i, &v, counter1, bin_coeffs);
-        v = new_v;
-        std::cout << "Done " << i << std::endl;
-    }
-    uint32_t comb = 0b101010101001;
-    uint32_t rank = HalfColexer(comb,bin_coeffs);
-    uint32_t comb_new = HalfUnColexer(6,rank,bin_coeffs);
-    std::cout<<"Comb "<<comb<<" new comb "<<comb_new<<std::endl;
-    auto stop = std::chrono::high_resolution_clock::now();
-    auto start1 = std::chrono::high_resolution_clock::now();
-    for (auto it = nodes.begin(); it != nodes.end(); ++it) {
-        char abm_unsafe = IncrementalMTD(&*it,6,6,counter1, &v, &SuitRanks, bin_coeffs);
-        //char abm_safe = AlphaBeta(&*it,0,13,counter1);
-        //if(abm_safe!=abm_unsafe){
-            //inconsistent++;
-            //std::cout<<(int)abm_unsafe<<" "<<(int)abm_safe<<std::endl;
-        //}
-    }
-    auto stop1= std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start);
-    std::cout << counter << std::endl;
-    std::cout << counter1 << std::endl;
-    std::cout << inconsistent << std::endl;
-    std::cout <<duration.count() << std::endl;
-    auto duration1 = std::chrono::duration_cast<std::chrono::milliseconds>(stop1 - start1);
-    std::cout << duration1.count() << std::endl;
-    std::cout << " Collisions " << TTable2.bucket_count() - TTable2.size() << std::endl;
-
-    std::vector<uint32_t> vec = GenQuads(8);
-    for (int i = 0; i < vec.size(); ++i) {
-        std::cout << (int)(vec[i]&0b1111) << " " << (int)((vec[i]&0b11110000)>>4) << " " <<(int)((vec[i]&0b111100000000)>>8) << " " <<(int)((vec[i]&0b1111000000000000)>>12) << std::endl;
-    }
-    //std::vector<int> ints;
-    //for (int i = 0; i < 2; ++i) {
-        //ints.push_back(i);
-    //}
-    //std::cout << vec.size() << std::endl;
-    
-}
+// TO DO//
+// CODE CLEANUP/REVIEW//
+//REMOVAL OF DEPRECATED FUNCTIONS//
+//SOME BENCHMARKING (10,000 IN 1400MS->0.14MS A GAME) FOR DEPTH 10 TTABLE  GENERATES DEPTH 10 TABLE IN 400 SECONDS//
+// (10,000->0.04ms A GAME FOR DEPTH 11 TTABLE//
+//RAN INTO ISSUE CONVERTING 11 TO 12, INVESTIGATE//

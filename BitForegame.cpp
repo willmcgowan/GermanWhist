@@ -271,7 +271,7 @@ public:
 		// if a face up card from the deck is not in players hand or discard it must be in opps unless it is the most recent face up//
 		necessary_cards = (necessary_cards & (~(hands_[player] | discard_|recent_faceup_card)));
 		//sufficient cards are all cards not in players hand,the discard, or the recent face up//
-		uint64_t sufficient_cards = (_bzhi_u64(~0, kNumRanks * kNumSuits) &(~(hands_[player] | discard_|recent_faceup_card)));
+		uint64_t sufficient_cards = (_bzhi_u64(~0, kNumRanks * kNumSuits) ^(hands_[player] | discard_|recent_faceup_card));
 		//sufficient_cards are not necessary //
 		sufficient_cards = (sufficient_cards & (~(necessary_cards)));
 		//we must now take into account the observation of voids//
